@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Namma Space Viewer</title>
+<meta name="description" content="Walk through a 3D space reconstructed from a phone video. WASD and mouse, no install.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e1116'/%3E%3Cpath d='M8 23V9l8 10V9m8 14V9' stroke='%23ff7a3d' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+  :root { --bg:#0e1116; --panel:rgba(14,17,22,.78); --ink:#e8ecf1; --mute:#9aa4b2; --accent:#ff7a3d; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui, sans-serif; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  .panel { position:fixed; background:var(--panel); border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:10px 14px; backdrop-filter:blur(6px); }
+  #hud { left:16px; bottom:16px; max-width:min(340px, calc(100vw - 32px)); }
+  #hud b { color:var(--accent); font-weight:600; }
+  #stats { right:16px; top:16px; font-variant-numeric:tabular-nums; color:var(--mute); }
+  #splash { inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; text-align:center; background:rgba(14,17,22,.86); position:fixed; z-index:5; }
+  #splash h1 { margin:0; font-size:28px; font-weight:600; }
+  #splash p { margin:0; color:var(--mute); max-width:420px; }
+  #splash button, #cal button { background:var(--accent); color:#111; border:0; border-radius:8px; padding:10px 22px; font-size:15px; font-weight:600; cursor:pointer; }
+  #splash button:disabled { opacity:.5; cursor:default; }
+  #bar { width:240px; height:4px; background:rgba(255,255,255,.15); border-radius:2px; overflow:hidden; }
+  #bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #cal { right:16px; bottom:16px; width:260px; display:none; }
+  #cal label { display:grid; grid-template-columns:70px 1fr 46px; gap:6px; align-items:center; margin:4px 0; color:var(--mute); }
+  #cal input[type=range] { width:100%; }
+  #cal button { padding:6px 12px; font-size:13px; margin-top:6px; }
+  #cross { position:fixed; left:50%; top:50%; width:6px; height:6px; margin:-3px 0 0 -3px; border-radius:50%; background:rgba(255,255,255,.7); pointer-events:none; display:none; }
+  #pad { position:fixed; inset:auto 0 0 0; height:40vh; display:none; }
+</style>
+</head>
+<body>
+<div id="splash">
+  <h1>Namma Space</h1>
+  <p id="msg">Loading the 3D model…</p>
+  <div id="bar"><i></i></div>
+  <button id="go" disabled>Enter</button>
+  <p style="font-size:12px">WASD or arrow keys to walk, mouse to look, Shift to sprint. On a phone, drag the left half to walk and the right half to look.</p>
+</div>
+<div id="cross"></div>
+<div id="hud" class="panel"><b>W A S D</b> walk · <b>Mouse</b> look · <b>Shift</b> sprint · <b>C</b> calibrate · <b>Esc</b> release mouse</div>
+<div id="stats" class="panel">– fps</div>
+<div id="cal" class="panel">
+  <label>Rot X<input id="rx" type="range" min="-180" max="180" step="1"><span></span></label>
+  <label>Rot Y<input id="ry" type="range" min="-180" max="180" step="1"><span></span></label>
+  <label>Rot Z<input id="rz" type="range" min="-180" max="180" step="1"><span></span></label>
+  <label>Scale<input id="sc" type="range" min="0.2" max="6" step="0.05"><span></span></label>
+  <label>Eye Y<input id="ey" type="range" min="-6" max="6" step="0.05"><span></span></label>
+  <label>Speed<input id="sp" type="range" min="0.3" max="4" step="0.05"><span></span></label>
+  <button id="copy">Copy config.json</button>
+</div>
+<div id="pad"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/postprocessing/Pass.js": "./vendor/Pass.js",
+  "@sparkjsdev/spark": "./vendor/spark.module.js"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+if (qs.has("clean")) document.head.insertAdjacentHTML("beforeend", "<style>#stats,#hud,#cross{display:none!important}</style>");
+
+// ---- config: assets/config.json overrides these defaults ----
+const cfg = {
+  splat: qs.get("splat") || "assets/scene.spz",
+  rotation: [180, 0, 0],      // degrees; COLMAP is y-down so the default flips X
+  scale: 1,
+  offset: [0, 0, 0],          // metres, applied after rotation and scale (puts the floor at y = 0)
+  eyeY: 0,                  // camera height in scene units after rotation/scale
+  start: [0, 0, 0],           // x, z of the start position; yaw in degrees below
+  startYaw: 0,
+  speed: 1.4,                 // metres per second (times Shift 2.2x)
+  bounds: null,               // [minX, maxX, minZ, maxZ] walkable box, null = auto from splat
+  ...(await fetch("assets/config.json").then(r => r.ok ? r.json() : {}).catch(() => ({}))),
+};
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.02, 500);
+camera.rotation.order = "YXZ";
+scene.add(new SparkRenderer({ renderer }));
+
+const splat = new SplatMesh({
+  url: cfg.splat,
+  onProgress: (e) => {
+    if (e && e.total) $("bar").firstElementChild.style.width = Math.round(100 * e.loaded / e.total) + "%";
+  },
+});
+scene.add(splat);
+
+const state = { yaw: THREE.MathUtils.degToRad(cfg.startYaw), pitch: 0, pos: new THREE.Vector3(cfg.start[0], cfg.eyeY, cfg.start[1]) };
+const keys = new Set();
+let bounds = cfg.bounds;
+let active = false;
+
+function applyTransform() {
+  splat.rotation.set(...cfg.rotation.map(THREE.MathUtils.degToRad));
+  splat.scale.setScalar(cfg.scale);
+  splat.position.set(...cfg.offset);
+  splat.updateMatrixWorld(true);
+  state.pos.y = cfg.eyeY;
+}
+
+async function ready() {
+  try { await splat.initialized; } catch (e) { $("msg").textContent = "Could not load the model: " + (e?.message || e); return; }
+  applyTransform();
+  if (!bounds) {
+    try {
+      const box = splat.getBoundingBox(true);
+      const sh = 0.35; // keep the camera this far inside the scanned extent
+      bounds = [box.min.x + sh, box.max.x - sh, box.min.z + sh, box.max.z - sh];
+      const c = box.getCenter(new THREE.Vector3());
+      if (!qs.has("keepstart") && !cfg.start.some(Boolean)) { state.pos.x = c.x; state.pos.z = c.z; }
+    } catch { bounds = null; }
+  }
+  const n = splat.packedSplats?.numSplats ?? splat.numSplats;
+  $("stats").dataset.n = n ? n.toLocaleString() + " splats" : "";
+  $("msg").textContent = "Model ready.";
+  $("bar").style.display = "none";
+  $("go").disabled = false;
+}
+ready();
+
+// ---- input ----
+const lockable = !matchMedia("(pointer: coarse)").matches;
+function enter() {
+  $("splash").style.display = "none";
+  $("cross").style.display = lockable ? "block" : "none";
+  active = true;
+  if (lockable) lockPointer();
+}
+function lockPointer() {
+  try { Promise.resolve(renderer.domElement.requestPointerLock?.()).catch(() => {}); } catch { /* drag-to-look below still works */ }
+}
+$("go").onclick = enter;
+renderer.domElement.addEventListener("click", () => { if (active && lockable && !document.pointerLockElement) lockPointer(); });
+let dragging = false;
+renderer.domElement.addEventListener("mousedown", () => { dragging = true; });
+addEventListener("mouseup", () => { dragging = false; });
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  keys.add(e.code);
+  if (e.code === "KeyC") { const c = $("cal"); c.style.display = c.style.display === "block" ? "none" : "block"; }
+});
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+addEventListener("mousemove", (e) => {
+  if (!active || (document.pointerLockElement !== renderer.domElement && !dragging)) return;
+  state.yaw -= e.movementX * 0.0022;
+  state.pitch = THREE.MathUtils.clamp(state.pitch - e.movementY * 0.0022, -1.4, 1.4);
+});
+
+// touch: left half = move, right half = look
+const touch = { move: null, look: null, mx: 0, mz: 0 };
+if (!lockable) {
+  addEventListener("touchstart", (e) => {
+    for (const t of e.changedTouches) {
+      const side = t.clientX < innerWidth / 2 ? "move" : "look";
+      touch[side] = { id: t.identifier, x: t.clientX, y: t.clientY };
+    }
+  }, { passive: true });
+  addEventListener("touchmove", (e) => {
+    for (const t of e.changedTouches) {
+      if (touch.move && t.identifier === touch.move.id) {
+        touch.mx = THREE.MathUtils.clamp((t.clientX - touch.move.x) / 60, -1, 1);
+        touch.mz = THREE.MathUtils.clamp((t.clientY - touch.move.y) / 60, -1, 1);
+      } else if (touch.look && t.identifier === touch.look.id) {
+        state.yaw -= (t.clientX - touch.look.x) * 0.005;
+        state.pitch = THREE.MathUtils.clamp(state.pitch - (t.clientY - touch.look.y) * 0.005, -1.4, 1.4);
+        touch.look.x = t.clientX; touch.look.y = t.clientY;
+      }
+    }
+  }, { passive: true });
+  addEventListener("touchend", (e) => {
+    for (const t of e.changedTouches) {
+      if (touch.move && t.identifier === touch.move.id) { touch.move = null; touch.mx = touch.mz = 0; }
+      if (touch.look && t.identifier === touch.look.id) touch.look = null;
+    }
+  }, { passive: true });
+}
+
+// ---- calibration panel ----
+const sliders = { rx: ["rotation", 0], ry: ["rotation", 1], rz: ["rotation", 2], sc: ["scale"], ey: ["eyeY"], sp: ["speed"] };
+function syncPanel() {
+  for (const [id, [k, i]] of Object.entries(sliders)) {
+    const v = i === undefined ? cfg[k] : cfg[k][i];
+    $(id).value = v; $(id).nextElementSibling.textContent = (+v).toFixed(1);
+  }
+}
+for (const [id, [k, i]] of Object.entries(sliders)) {
+  $(id).addEventListener("input", () => {
+    const v = parseFloat($(id).value);
+    if (i === undefined) cfg[k] = v; else cfg[k][i] = v;
+    $(id).nextElementSibling.textContent = v.toFixed(1);
+    applyTransform();
+  });
+}
+$("copy").onclick = async () => {
+  const out = { rotation: cfg.rotation, scale: cfg.scale, offset: cfg.offset, eyeY: cfg.eyeY, start: [state.pos.x, state.pos.z], startYaw: THREE.MathUtils.radToDeg(state.yaw), speed: cfg.speed, bounds };
+  const text = JSON.stringify(out, null, 2);
+  try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; } catch { prompt("config.json", text); }
+  setTimeout(() => ($("copy").textContent = "Copy config.json"), 1200);
+};
+syncPanel();
+
+// ---- loop ----
+const clock = new THREE.Clock();
+let frames = 0, acc = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (active) {
+    let f = (keys.has("KeyW") || keys.has("ArrowUp") ? 1 : 0) - (keys.has("KeyS") || keys.has("ArrowDown") ? 1 : 0) - touch.mz;
+    let s = (keys.has("KeyD") || keys.has("ArrowRight") ? 1 : 0) - (keys.has("KeyA") || keys.has("ArrowLeft") ? 1 : 0) + touch.mx;
+    const len = Math.hypot(f, s);
+    if (len > 1) { f /= len; s /= len; }
+    const v = cfg.speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 2.2 : 1) * dt;
+    const sin = Math.sin(state.yaw), cos = Math.cos(state.yaw);
+    let nx = state.pos.x + (-sin * f + cos * s) * v;
+    let nz = state.pos.z + (-cos * f - sin * s) * v;
+    if (bounds) { nx = THREE.MathUtils.clamp(nx, bounds[0], bounds[1]); nz = THREE.MathUtils.clamp(nz, bounds[2], bounds[3]); }
+    state.pos.x = nx; state.pos.z = nz;
+  }
+  camera.position.copy(state.pos);
+  camera.rotation.set(state.pitch, state.yaw, 0);
+  renderer.render(scene, camera);
+  frames++; acc += dt;
+  if (acc >= 0.5) {
+    $("stats").textContent = Math.round(frames / acc) + " fps" + ($("stats").dataset.n ? " · " + $("stats").dataset.n : "");
+    frames = 0; acc = 0;
+  }
+});
+addEventListener("resize", () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+});
+window.__nammaspace = { cfg, state, splat, camera, get bounds() { return bounds; } };
+</script>
+</body>
+</html>
